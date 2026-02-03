@@ -34,7 +34,10 @@ void process_serial_commands() {
     
     // Update non-blocking sleep state
     commandParser->update_sleep_state();
-    
+
+    // Process deferred press releases
+    commandParser->update_press_state();
+
     // Skip command processing if we're in a sleep state
     if (commandParser->is_sleeping()) {
         return;

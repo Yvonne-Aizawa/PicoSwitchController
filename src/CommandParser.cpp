@@ -49,8 +49,10 @@ bool CommandParser::parse_and_execute(const char* command_line) {
             }
             break;
         case 'S':
-            if (command[1] == 'T') { // "STICK"
+            if (command[1] == 'T' && command[2] == 'I') { // "STICK"
                 return parse_stick_command(ptr);
+            } else if (command[1] == 'T' && command[2] == 'A') { // "STATE"
+                return parse_state_command(ptr);
             } else if (command[1] == 'L') { // "SLEEP"
                 return parse_sleep_command(ptr);
             }
@@ -90,43 +92,33 @@ bool CommandParser::parse_button_command(const char* args, bool pressed) {
 }
 
 bool CommandParser::parse_press_command(const char* args) {
-    // PRESS command using consolidation for maximum reliability
+    // PRESS command: press buttons now, defer release until after the
+    // pressed state has been transmitted in an HID report.
     const char* ptr = args;
     char button_name[16];
-    
+
     // Start consolidation for press phase
     _switch->start_consolidation();
-    
+
     // Press all buttons in same frame
     while (*ptr) {
         if (!parse_button_name(ptr, button_name, sizeof(button_name))) {
             break;
         }
-        
+
         _switch->set_button(button_name, true);
         skip_whitespace(ptr);
     }
-    
+
     // End press consolidation and transmit
     _switch->end_consolidation();
-    
-    // Start consolidation for release phase  
-    _switch->start_consolidation();
-    
-    // Release all buttons in same frame
-    ptr = args;  // Reset pointer
-    while (*ptr) {
-        if (!parse_button_name(ptr, button_name, sizeof(button_name))) {
-            break;
-        }
-        
-        _switch->set_button(button_name, false);
-        skip_whitespace(ptr);
-    }
-    
-    // End release consolidation and transmit
-    _switch->end_consolidation();
-    
+
+    // Store args for deferred release
+    strncpy(_press_release_args, args, sizeof(_press_release_args) - 1);
+    _press_release_args[sizeof(_press_release_args) - 1] = '\0';
+    _press_release_pending = true;
+    _press_release_time = to_ms_since_boot(get_absolute_time());
+
     return true;
 }
 
@@ -162,6 +154,52 @@ bool CommandParser::parse_stick_command(const char* args) {
     return true;
 }
 
+bool CommandParser::parse_state_command(const char* args) {
+    // STATE <18 binary digits> [LH LV RH RV]
+    // Button order: A B X Y  L R ZL ZR  + - Home Capture  L3 R3  DUp DDown DLeft DRight
+    // Stick values are optional floats in [-1.0, 1.0], default to 0.0
+    static const char* button_names[] = {
+        "a", "b", "x", "y",
+        "l", "r", "zl", "zr",
+        "plus", "minus", "home", "capture",
+        "l_stick", "r_stick",
+        "dpad_up", "dpad_down", "dpad_left", "dpad_right"
+    };
+    static const int NUM_BUTTONS = 18;
+
+    const char* ptr = args;
+    skip_whitespace(ptr);
+
+    // Validate we have enough binary digits
+    int len = 0;
+    while (ptr[len] == '0' || ptr[len] == '1') len++;
+    if (len != NUM_BUTTONS) {
+        FastLogger::log_fmt("STATE requires %d binary digits, got %d", NUM_BUTTONS, len);
+        return false;
+    }
+
+    _switch->start_consolidation();
+
+    for (int i = 0; i < NUM_BUTTONS; i++) {
+        _switch->set_button(button_names[i], ptr[i] == '1');
+    }
+    ptr += NUM_BUTTONS;
+
+    // Parse optional stick values: LH LV RH RV
+    float lh = 0.0f, lv = 0.0f, rh = 0.0f, rv = 0.0f;
+    if (parse_float(ptr, lh)) {
+        if (parse_float(ptr, lv)) {
+            _switch->set_stick("l_stick", lh, lv);
+            if (parse_float(ptr, rh) && parse_float(ptr, rv)) {
+                _switch->set_stick("r_stick", rh, rv);
+            }
+        }
+    }
+
+    _switch->end_consolidation();
+    return true;
+}
+
 bool CommandParser::parse_sleep_command(const char* args) {
     const char* ptr = args;
     skip_whitespace(ptr);
@@ -178,6 +216,18 @@ bool CommandParser::parse_sleep_command(const char* args) {
     _sleep_end_time = to_ms_since_boot(get_absolute_time()) + sleep_duration_ms;
     
     return true;
+}
+
+void CommandParser::update_press_state() {
+    if (!_press_release_pending) return;
+
+    // Wait at least 100ms to ensure the pressed state is visible
+    uint32_t elapsed = to_ms_since_boot(get_absolute_time()) - _press_release_time;
+    if (elapsed < 100) return;
+
+    // Apply the deferred release
+    _press_release_pending = false;
+    parse_button_command(_press_release_args, false);
 }
 
 bool CommandParser::is_sleeping() {
